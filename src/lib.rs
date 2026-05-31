@@ -41,7 +41,7 @@
 )]
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, xdr::ToXdr, Address,
-    BytesN, Env, IntoVal, Map, Symbol, Vec,
+    Bytes, BytesN, Env, IntoVal, Map, Symbol, Vec,
 };
 
 // Issue #109 â€” Revenue report correction and audit-summary reconciliation are
@@ -398,6 +398,25 @@ pub struct AuditReconciliationResult {
     pub computed_report_count: u64,
     pub is_consistent: bool,
     pub is_saturated: bool,
+}
+
+/// One entry in a distribution proof: the holder's address, their share in basis points,
+/// and the normalized payout computed by the contract for a specific period.
+///
+/// Returned by `prove_distribution_for_period`. The ordering of entries in the returned
+/// vector matches the order of the `holders` input slice exactly, enabling deterministic
+/// digest verification by off-chain indexers.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DistributionEntry {
+    /// The holder's address.
+    pub holder: Address,
+    /// The holder's share in basis points (0–10000).
+    pub share_bps: u32,
+    /// The normalized payout computed by the contract for this period.
+    /// Equals `compute_share(normalize_amount(period_revenue, decimals), share_bps, rounding_mode)`.
+    /// Zero when `share_bps == 0` or `period_revenue == 0`.
+    pub normalized_payout: i128,
 }
 
 /// Pending issuer transfer details including expiry tracking.
