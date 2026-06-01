@@ -1,4 +1,4 @@
-﻿#![no_std]
+#![no_std]
 #![deny(unsafe_code)]
 #![allow(dead_code)]
 #![allow(unused_variables)]
@@ -162,11 +162,13 @@ pub enum RevoraError {
 pub mod vesting;
 
 #[cfg(test)]
+mod test_claim_transfer_fail;
+#[cfg(test)]
 mod test_duplicates;
 #[cfg(test)]
 mod test_min_revenue_threshold_boundary;
 #[cfg(test)]
-mod test_claim_transfer_fail;
+mod test_prove_distribution;
 
 // â”€â”€ Event symbols â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const EVENT_REVENUE_REPORTED: Symbol = symbol_short!("rev_rep");
@@ -2333,7 +2335,15 @@ impl RevoraRevenueShare {
         let blacklist = if event_only {
             Vec::new(&env)
         } else {
-            Self::get_blacklist_page(env.clone(), issuer.clone(), namespace.clone(), token.clone(), 0, MAX_PAGE_LIMIT).0
+            Self::get_blacklist_page(
+                env.clone(),
+                issuer.clone(),
+                namespace.clone(),
+                token.clone(),
+                0,
+                MAX_PAGE_LIMIT,
+            )
+            .0
         };
 
         let mut actual_override = false;
@@ -3358,8 +3368,8 @@ impl RevoraRevenueShare {
     /// ### Returns
     /// The maximum allowed blacklist size for the offering.
     fn get_effective_blacklist_limit(env: &Env, offering_id: &OfferingId) -> u32 {
-        let key = DataKey::BlacklistSizeLimit(offering_id.clone());
-        env.storage().persistent().get::<DataKey, u32>(&key).unwrap_or(MAX_BLACKLIST_SIZE)
+        let key = DataKey2::BlacklistSizeLimit(offering_id.clone());
+        env.storage().persistent().get::<DataKey2, u32>(&key).unwrap_or(MAX_BLACKLIST_SIZE)
     }
 
     /// Set the per-offering blacklist size limit.
@@ -4683,41 +4693,87 @@ impl RevoraRevenueShare {
     }
 
     /// Configure the reporting access window for an offering. If unset, always open.
-    pub fn set_report_window(env: Env, issuer: Address, namespace: Symbol, token: Address, start_timestamp: u64, end_timestamp: u64) -> Result<(), RevoraError> {
+    pub fn set_report_window(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        start_timestamp: u64,
+        end_timestamp: u64,
+    ) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
-        let current_issuer = Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone()).ok_or(RevoraError::OfferingNotFound)?;
-        if current_issuer != issuer { return Err(RevoraError::OfferingNotFound); }
+        let current_issuer =
+            Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
+                .ok_or(RevoraError::OfferingNotFound)?;
+        if current_issuer != issuer {
+            return Err(RevoraError::OfferingNotFound);
+        }
         issuer.require_auth();
         let window = AccessWindow { start_timestamp, end_timestamp };
         Self::validate_window(&window)?;
-        let offering_id = OfferingId { issuer: issuer.clone(), namespace: namespace.clone(), token: token.clone() };
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
         env.storage().persistent().set(&WindowDataKey::Report(offering_id), &window);
-        env.events().publish((EVENT_REPORT_WINDOW_SET, issuer, namespace, token), (start_timestamp, end_timestamp));
+        env.events().publish(
+            (EVENT_REPORT_WINDOW_SET, issuer, namespace, token),
+            (start_timestamp, end_timestamp),
+        );
         Ok(())
     }
 
     /// Configure the claiming access window for an offering. If unset, always open.
-    pub fn set_claim_window(env: Env, issuer: Address, namespace: Symbol, token: Address, start_timestamp: u64, end_timestamp: u64) -> Result<(), RevoraError> {
+    pub fn set_claim_window(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        start_timestamp: u64,
+        end_timestamp: u64,
+    ) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
-        let current_issuer = Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone()).ok_or(RevoraError::OfferingNotFound)?;
-        if current_issuer != issuer { return Err(RevoraError::OfferingNotFound); }
+        let current_issuer =
+            Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
+                .ok_or(RevoraError::OfferingNotFound)?;
+        if current_issuer != issuer {
+            return Err(RevoraError::OfferingNotFound);
+        }
         issuer.require_auth();
         let window = AccessWindow { start_timestamp, end_timestamp };
         Self::validate_window(&window)?;
-        let offering_id = OfferingId { issuer: issuer.clone(), namespace: namespace.clone(), token: token.clone() };
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
         env.storage().persistent().set(&WindowDataKey::Claim(offering_id), &window);
-        env.events().publish((EVENT_CLAIM_WINDOW_SET, issuer, namespace, token), (start_timestamp, end_timestamp));
+        env.events().publish(
+            (EVENT_CLAIM_WINDOW_SET, issuer, namespace, token),
+            (start_timestamp, end_timestamp),
+        );
         Ok(())
     }
 
     /// Read configured reporting window (if any) for an offering.
-    pub fn get_report_window(env: Env, issuer: Address, namespace: Symbol, token: Address) -> Option<AccessWindow> {
+    pub fn get_report_window(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+    ) -> Option<AccessWindow> {
         let offering_id = OfferingId { issuer, namespace, token };
         env.storage().persistent().get(&WindowDataKey::Report(offering_id))
     }
 
     /// Read configured claiming window (if any) for an offering.
-    pub fn get_claim_window(env: Env, issuer: Address, namespace: Symbol, token: Address) -> Option<AccessWindow> {
+    pub fn get_claim_window(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+    ) -> Option<AccessWindow> {
         let offering_id = OfferingId { issuer, namespace, token };
         env.storage().persistent().get(&WindowDataKey::Claim(offering_id))
     }
@@ -4887,6 +4943,114 @@ impl RevoraRevenueShare {
         );
 
         Ok(total_payout)
+    }
+
+    /// Return a deterministic per-holder distribution proof for a single period.
+    ///
+    /// For each address in `holders` (capped at `MAX_CHUNK_PERIODS`), the contract reads
+    /// the stored `HolderShare`, normalizes the period revenue to 7-decimal canonical units,
+    /// and computes the payout using the offering's persisted `RoundingMode`. The result
+    /// vector preserves the input order exactly, so off-chain indexers can reproduce the
+    /// digest by applying the same ordering.
+    ///
+    /// ### Digest construction
+    /// `SHA-256(XDR(issuer) || XDR(namespace) || XDR(token) || XDR(period_id) || XDR(entries))`
+    /// where `entries` is the `Vec<DistributionEntry>` returned alongside the digest.
+    /// An unknown `period_id` returns zero payouts; callers detect this by checking
+    /// that all `normalized_payout` values are zero.
+    ///
+    /// ### Bounds
+    /// `holders` is silently capped at `MAX_CHUNK_PERIODS` (200).
+    ///
+    /// ### Security
+    /// - Read-only: no storage writes, no auth required.
+    /// - Digest covers contract-computed values only; cannot be forged without
+    ///   changing on-chain `HolderShare` or `PeriodRevenue` state.
+    pub fn prove_distribution_for_period(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        period_id: u64,
+        holders: Vec<Address>,
+    ) -> (Vec<DistributionEntry>, BytesN<32>) {
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
+
+        // Look up period revenue; treat missing period as zero revenue (unknown period).
+        let revenue: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PeriodRevenue(offering_id.clone(), period_id))
+            .unwrap_or(0);
+
+        let decimals = Self::get_payment_token_decimals(
+            env.clone(),
+            issuer.clone(),
+            namespace.clone(),
+            token.clone(),
+        );
+        let normalized_revenue = Self::normalize_amount(revenue, decimals);
+
+        let mode =
+            Self::get_rounding_mode(env.clone(), issuer.clone(), namespace.clone(), token.clone());
+
+        // Cap input to MAX_CHUNK_PERIODS to bound compute cost.
+        let cap = core::cmp::min(holders.len(), MAX_CHUNK_PERIODS);
+        let mut entries: Vec<DistributionEntry> = Vec::new(&env);
+        for i in 0..cap {
+            let holder = holders.get(i).unwrap();
+            let share_bps = env
+                .storage()
+                .persistent()
+                .get(&DataKey::HolderShare(offering_id.clone(), holder.clone()))
+                .unwrap_or(0u32);
+            let normalized_payout =
+                Self::compute_share(env.clone(), normalized_revenue, share_bps, mode);
+            entries.push_back(DistributionEntry { holder, share_bps, normalized_payout });
+        }
+
+        // Build digest: SHA-256 over XDR of (issuer, namespace, token, period_id, entries).
+        let mut payload = Bytes::new(&env);
+        payload.append(&issuer.to_xdr(&env));
+        payload.append(&namespace.to_xdr(&env));
+        payload.append(&token.to_xdr(&env));
+        payload.append(&period_id.to_xdr(&env));
+        payload.append(&entries.clone().to_xdr(&env));
+        let digest: BytesN<32> = env.crypto().sha256(&payload).into();
+
+        (entries, digest)
+    }
+
+    /// Return unclaimed period IDs for a holder on an offering.
+    /// Ordering: by deposit index (creation order), deterministic.
+    pub fn get_pending_periods(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        holder: Address,
+    ) -> Vec<u64> {
+        let offering_id = OfferingId { issuer, namespace, token };
+        let count_key = DataKey::PeriodCount(offering_id.clone());
+        let period_count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+
+        let idx_key = DataKey::LastClaimedIdx(offering_id.clone(), holder);
+        let start_idx: u32 = env.storage().persistent().get(&idx_key).unwrap_or(0);
+
+        let mut periods = Vec::new(&env);
+        for i in start_idx..period_count {
+            let entry_key = DataKey::PeriodEntry(offering_id.clone(), i);
+            let period_id: u64 = env.storage().persistent().get(&entry_key).unwrap_or(0);
+            if period_id == 0 {
+                continue;
+            }
+            periods.push_back(period_id);
+        }
+        periods
     }
 }
 
@@ -5189,34 +5353,6 @@ impl RevoraRevenueShare {
     /// * `max_periods` - The maximum number of periods to claim in this call.
     ///
     /// # Events
-
-    /// Return unclaimed period IDs for a holder on an offering.
-    /// Ordering: by deposit index (creation order), deterministic (#38).
-    pub fn get_pending_periods(
-        env: Env,
-        issuer: Address,
-        namespace: Symbol,
-        token: Address,
-        holder: Address,
-    ) -> Vec<u64> {
-        let offering_id = OfferingId { issuer, namespace, token };
-        let count_key = DataKey::PeriodCount(offering_id.clone());
-        let period_count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
-
-        let idx_key = DataKey::LastClaimedIdx(offering_id.clone(), holder);
-        let start_idx: u32 = env.storage().persistent().get(&idx_key).unwrap_or(0);
-
-        let mut periods = Vec::new(&env);
-        for i in start_idx..period_count {
-            let entry_key = DataKey::PeriodEntry(offering_id.clone(), i);
-            let period_id: u64 = env.storage().persistent().get(&entry_key).unwrap_or(0);
-            if period_id == 0 {
-                continue;
-            }
-            periods.push_back(period_id);
-        }
-        periods
-    }
 
     /// Read-only: return a page of pending period IDs for a holder, bounded by `limit`.
     /// Returns `(periods_page, next_cursor)` where `next_cursor` is `Some(next_index)` when more
@@ -6296,5 +6432,3 @@ mod issue_370_373_tests {
         );
     }
 }
-
-

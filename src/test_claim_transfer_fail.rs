@@ -41,9 +41,8 @@
 
 use crate::{RevoraError, RevoraRevenueShare, RevoraRevenueShareClient};
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short,
-    testutils::Address as _,
-    token, Address, Env, String,
+    contract, contractimpl, contracttype, symbol_short, testutils::Address as _, token, Address,
+    Env, String,
 };
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -71,8 +70,7 @@ impl FailingTransferToken {
 
     /// Mint tokens to `to` (test helper, no auth).
     pub fn mint(env: Env, to: Address, amount: i128) {
-        let bal: i128 =
-            env.storage().persistent().get(&TokenKey::Balance(to.clone())).unwrap_or(0);
+        let bal: i128 = env.storage().persistent().get(&TokenKey::Balance(to.clone())).unwrap_or(0);
         env.storage().persistent().set(&TokenKey::Balance(to), &(bal + amount));
     }
 
@@ -268,11 +266,7 @@ fn claim_transfer_fail_does_not_advance_last_claimed_idx() {
         pending_before.len(),
         "LastClaimedIdx must not advance on transfer failure"
     );
-    assert_eq!(
-        pending_after.get(0),
-        pending_before.get(0),
-        "pending period IDs must be unchanged"
-    );
+    assert_eq!(pending_after.get(0), pending_before.get(0), "pending period IDs must be unchanged");
 }
 
 /// Holder balance is unchanged when claim transfer fails.
@@ -326,7 +320,7 @@ fn claim_transfer_fail_then_retry_succeeds() {
     // Retry — should now succeed
     let r2 = revora.try_claim(&holder, &issuer, &symbol_short!("def"), &offering_token, &50);
     assert!(r2.is_ok(), "retry after fixing token should succeed, got {r2:?}");
-    assert_eq!(r2.unwrap(), 100_000, "holder should receive full payout on retry");
+    assert_eq!(r2.unwrap().unwrap(), 100_000, "holder should receive full payout on retry");
 
     // Pending periods now empty
     let pending =
@@ -434,7 +428,7 @@ fn claim_transfer_fail_does_not_affect_sibling_offering() {
     // Register a second offering with a normal Stellar asset token
     let offering_token_b = Address::generate(&env);
     let admin_b = Address::generate(&env);
-    let payment_token_b = env.register_stellar_asset_contract(admin_b.clone());
+    let payment_token_b = env.register_stellar_asset_contract_v2(admin_b.clone()).address();
     token::StellarAssetClient::new(&env, &payment_token_b).mint(&issuer, &100_000);
 
     revora.register_offering(
@@ -445,13 +439,7 @@ fn claim_transfer_fail_does_not_affect_sibling_offering() {
         &payment_token_b,
         &0,
     );
-    revora.set_holder_share(
-        &issuer,
-        &symbol_short!("def"),
-        &offering_token_b,
-        &holder,
-        &10_000,
-    );
+    revora.set_holder_share(&issuer, &symbol_short!("def"), &offering_token_b, &holder, &10_000);
     revora.deposit_revenue(
         &issuer,
         &symbol_short!("def"),
@@ -468,7 +456,7 @@ fn claim_transfer_fail_does_not_affect_sibling_offering() {
     // Claim on offering B succeeds (normal token)
     let r_b = revora.try_claim(&holder, &issuer, &symbol_short!("def"), &offering_token_b, &50);
     assert!(r_b.is_ok(), "sibling offering claim must succeed, got {r_b:?}");
-    assert_eq!(r_b.unwrap(), 100_000);
+    assert_eq!(r_b.unwrap().unwrap(), 100_000);
 
     // Offering A: period 1 still pending
     let pending_a =
