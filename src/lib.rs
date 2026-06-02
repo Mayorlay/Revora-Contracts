@@ -37,7 +37,8 @@
     clippy::manual_let_else,
     clippy::empty_line_after_doc_comments,
     clippy::doc_lazy_continuation,
-    clippy::unnecessary_lazy_evaluations
+    clippy::unnecessary_lazy_evaluations,
+    clippy::enum_variant_names
 )]
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, xdr::ToXdr, Address,
@@ -144,6 +145,8 @@ pub enum RevoraError {
     OfferingFrozen = 42,
     /// Issuer transfer has expired.
     IssuerTransferExpired = 43,
+    /// Transfer blocked because the offering has pre-cliff vesting schedules.
+    VestingTransferBlocked = 48,
     /// Contract is paused.
     ContractPaused = 44,
     /// Blacklist size limit exceeded.
@@ -247,13 +250,17 @@ pub struct Proposal {
 const EVENT_SNAP_CONFIG: Symbol = symbol_short!("snap_cfg");
 
 const EVENT_INIT: Symbol = symbol_short!("init");
+const EVENT_LAYOUT_VERSION: Symbol = symbol_short!("layout_v");
 const EVENT_PAUSED: Symbol = symbol_short!("paused");
 const EVENT_UNPAUSED: Symbol = symbol_short!("unpaused");
+/// Versioned pause event carrying the tier (SoftPaused / HardPaused / NotPaused).
+const EVENT_PAUSED2: Symbol = symbol_short!("paused2");
 
 const EVENT_ISSUER_TRANSFER_PROPOSED: Symbol = symbol_short!("iss_prop");
 const EVENT_ISSUER_TRANSFER_ACCEPTED: Symbol = symbol_short!("iss_acc");
 const EVENT_ISSUER_TRANSFER_CANCELLED: Symbol = symbol_short!("iss_canc");
 const EVENT_ISSUER_TRANSFER_REJECTED: Symbol = symbol_short!("iss_rej");
+const EVENT_ISSUER_TRANSFER_VESTING_MIGRATED: Symbol = symbol_short!("iss_vst");
 const EVENT_TESTNET_MODE: Symbol = symbol_short!("test_mode");
 
 const EVENT_DIST_CALC: Symbol = symbol_short!("dist_calc");
@@ -328,6 +335,8 @@ const EVENT_CLAIM_DELAY_SET: Symbol = symbol_short!("dly_set");
 // â”€â”€ Data structures â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 /// Contract version identifier (#23). Bumped when storage or semantics change; used for migration and compatibility.
 pub const CONTRACT_VERSION: u32 = 23;
+/// Persistent storage layout version. Bump when adding/renaming DataKey variants.
+pub const STORAGE_LAYOUT_VERSION: u32 = 1;
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -605,6 +614,8 @@ pub enum DataKey {
     PeriodCount(OfferingId),
     /// Holder's share in basis points for (offering_id, holder).
     HolderShare(OfferingId, Address),
+    /// Per-offering running total of all persisted holder shares (basis points).
+    HolderShareTotal(OfferingId),
     /// Next period index to claim for (offering_id, holder).
     LastClaimedIdx(OfferingId, Address),
     /// Payment token address for an offering.
@@ -662,6 +673,8 @@ pub enum DataKey {
     EventOnlyMode,
     /// Last migrated storage version for upgrade hooks.
     DeployedVersion,
+    /// Persistent storage layout version stamp. Set during `initialize` and migrations.
+    StorageLayoutVersion,
 
     /// Platform fee in basis points.
     PlatformFeeBps,
@@ -977,9 +990,36 @@ impl RevoraRevenueShare {
 
     /// Returns error if contract is frozen (#32). Call at start of state-mutating entrypoints.
     fn require_not_frozen(env: &Env) -> Result<(), RevoraError> {
+        // Ensure on-chain storage layout is compatible with this binary.
+        Self::assert_storage_layout_compatible(env)?;
+
         let key = DataKey::Frozen;
         if env.storage().persistent().get::<DataKey, bool>(&key).unwrap_or(false) {
             return Err(RevoraError::ContractFrozen);
+        }
+        Ok(())
+    }
+
+    /// Ensure the on-chain storage layout is compatible with this binary.
+    ///
+    /// - If the on-chain layout version is greater than the compiled `STORAGE_LAYOUT_VERSION`,
+    ///   reject with `MigrationDowngradeNotAllowed`.
+    /// - If the on-chain layout version is absent or older, stamp the storage with the
+    ///   compiled `STORAGE_LAYOUT_VERSION` and emit `EVENT_LAYOUT_VERSION` to signal migration.
+    fn assert_storage_layout_compatible(env: &Env) -> Result<(), RevoraError> {
+        let key = DataKey::StorageLayoutVersion;
+        if let Some(stored_v) = env.storage().persistent().get::<DataKey, u32>(&key) {
+            if stored_v > STORAGE_LAYOUT_VERSION {
+                return Err(RevoraError::MigrationDowngradeNotAllowed);
+            }
+            if stored_v < STORAGE_LAYOUT_VERSION {
+                env.storage().persistent().set(&key, &STORAGE_LAYOUT_VERSION);
+                env.events().publish((EVENT_LAYOUT_VERSION,), STORAGE_LAYOUT_VERSION);
+            }
+        } else {
+            // No layout stamp found: stamp it now (first-time initialize/migration path).
+            env.storage().persistent().set(&key, &STORAGE_LAYOUT_VERSION);
+            env.events().publish((EVENT_LAYOUT_VERSION,), STORAGE_LAYOUT_VERSION);
         }
         Ok(())
     }
@@ -1159,14 +1199,33 @@ impl RevoraRevenueShare {
             namespace: namespace.clone(),
             token: token.clone(),
         };
+
+        // Maintain a running total of persisted holder shares for this offering.
+        let total_key = DataKey::HolderShareTotal(offering_id.clone());
+        let mut current_total: u32 = env.storage().persistent().get(&total_key).unwrap_or(0);
+
+        let old_share: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::HolderShare(offering_id.clone(), holder.clone()))
+            .unwrap_or(0);
+
+        let new_total = current_total.saturating_sub(old_share).saturating_add(share_bps);
+        if new_total > 10_000 {
+            return Err(RevoraError::InvalidShareBps);
+        }
+
+        // Persist updated holder share and running total.
         env.storage()
             .persistent()
-            .set(&DataKey::HolderShare(offering_id, holder.clone()), &share_bps);
+            .set(&DataKey::HolderShare(offering_id.clone(), holder.clone()), &share_bps);
+        env.storage().persistent().set(&total_key, &new_total);
+
         env.events().publish(
             (EVENT_SHARE_SET, issuer.clone(), namespace.clone(), token.clone()),
             (holder.clone(), share_bps),
         );
-        // Versioned v2 event: [2, holder, share_bps] â€” always emitted (#RC26Q2-C31)
+        // Versioned v2 event: [2, holder, share_bps] — always emitted (#RC26Q2-C31)
         Self::emit_v2_event(
             env,
             (EVENT_SHARE_SET_V2, issuer, namespace, token),
@@ -1574,6 +1633,25 @@ impl RevoraRevenueShare {
         Ok(())
     }
 
+    /// Read-only accessor for the on-chain storage layout version stamp.
+    pub fn storage_layout_version(env: Env) -> Option<u32> {
+        env.storage().persistent().get(&DataKey::StorageLayoutVersion)
+    }
+
+    /// Admin-only setter to adjust the stored layout version (used by migrations/tests).
+    /// Emits `EVENT_LAYOUT_VERSION` when the stored value is changed.
+    pub fn set_storage_layout_version(env: Env, caller: Address, v: u32) -> Result<(), RevoraError> {
+        let admin: Address =
+            env.storage().persistent().get(&DataKey::Admin).ok_or(RevoraError::NotInitialized)?;
+        admin.require_auth();
+        if caller != admin {
+            return Err(RevoraError::NotAuthorized);
+        }
+        env.storage().persistent().set(&DataKey::StorageLayoutVersion, &v);
+        env.events().publish((EVENT_LAYOUT_VERSION,), v);
+        Ok(())
+    }
+
     pub fn get_pending_issuer_transfer(
         env: Env,
         issuer: Address,
@@ -1770,6 +1848,40 @@ impl RevoraRevenueShare {
             return Err(RevoraError::LimitReached);
         }
 
+        // Migrate any vesting schedules corresponding to this offering before completing
+        // the issuer transfer. This preserves active schedules under the new issuer key
+        // and prevents orphaned pre-cliff schedules.
+        let vesting_offering_id = vesting::VestingOfferingId {
+            issuer: old_issuer.clone(),
+            token: offering_id.token.clone(),
+        };
+        match vesting::migrate_offering_schedules(
+            &env,
+            &vesting_offering_id,
+            new_issuer.clone(),
+            current_timestamp,
+        ) {
+            Ok(beneficiaries) => {
+                for beneficiary in beneficiaries.iter() {
+                    env.events().publish(
+                        (
+                            EVENT_ISSUER_TRANSFER_VESTING_MIGRATED,
+                            offering_id.namespace.clone(),
+                            offering_id.token.clone(),
+                            beneficiary.clone(),
+                        ),
+                        (old_issuer.clone(), new_issuer.clone()),
+                    );
+                }
+            }
+            Err(vesting::VestingError::SchedulePreCliff) => {
+                return Err(RevoraError::VestingTransferBlocked);
+            }
+            Err(_) => {
+                // If the vesting index is empty or stale, ignore it and continue.
+            }
+        }
+
         // Register namespace metadata for the new issuer.
         Self::ensure_issuer_registered(&env, &new_issuer);
         Self::ensure_namespace_registered(&env, &new_issuer, &offering_id.namespace);
@@ -1901,15 +2013,22 @@ impl RevoraRevenueShare {
         if let Some(ref s) = safety {
             env.storage().persistent().set(&DataKey::Safety, &s);
         }
-        env.storage().persistent().set(&DataKey::Paused, &false);
+        env.storage().persistent().set(&DataKey::Paused, &PauseState::NotPaused);
         let eo = event_only.unwrap_or(false);
         env.storage().persistent().set(&DataKey2::ContractFlags, &(false, eo));
+        // Stamp storage layout version for future compatibility checks.
+        env.storage()
+            .persistent()
+            .set(&DataKey::StorageLayoutVersion, &STORAGE_LAYOUT_VERSION);
+        env.events().publish((EVENT_LAYOUT_VERSION,), STORAGE_LAYOUT_VERSION);
+
         env.events().publish((EVENT_INIT, admin.clone()), (safety, eo));
     }
 
-    /// Pause the contract (Admin only).
+    /// Soft-pause the contract (Admin only).
     ///
-    /// When paused, all state-mutating operations are disabled to protect the system.
+    /// `SoftPaused` blocks reports and deposits but **allows** `claim`, so
+    /// holders can still withdraw their funds during incident response.
     /// This operation is idempotent.
     ///
     /// ### Parameters
@@ -1921,14 +2040,17 @@ impl RevoraRevenueShare {
         if caller != admin {
             return Err(RevoraError::NotAuthorized);
         }
-        env.storage().persistent().set(&DataKey::Paused, &true);
+        env.storage().persistent().set(&DataKey::Paused, &PauseState::SoftPaused);
+        // Legacy compatibility event
         env.events().publish((EVENT_PAUSED, caller.clone()), ());
+        // Versioned tier event
+        env.events().publish((EVENT_PAUSED2, caller.clone()), (PauseState::SoftPaused,));
         Ok(())
     }
 
     /// Unpause the contract (Admin only).
     ///
-    /// Re-enables state-mutating operations after a pause.
+    /// Re-enables all operations after a pause.
     /// This operation is idempotent.
     ///
     /// ### Parameters
@@ -1940,14 +2062,38 @@ impl RevoraRevenueShare {
         if caller != admin {
             return Err(RevoraError::NotAuthorized);
         }
-        env.storage().persistent().set(&DataKey::Paused, &false);
+        env.storage().persistent().set(&DataKey::Paused, &PauseState::NotPaused);
         env.events().publish((EVENT_UNPAUSED, caller.clone()), ());
+        env.events().publish((EVENT_PAUSED2, caller.clone()), (PauseState::NotPaused,));
         Ok(())
     }
 
-    /// Pause the contract (Safety role only).
+    /// Hard-pause the contract (Admin only).
     ///
-    /// Allows the safety role to trigger an emergency pause.
+    /// `HardPaused` blocks **every** state-mutating operation including `claim`.
+    /// Use this tier only when funds must be fully locked (e.g. critical exploit).
+    /// Only the admin can escalate to HardPaused; the safety role is limited to SoftPaused.
+    ///
+    /// ### Parameters
+    /// - `caller`: The address of the admin (must match initialized admin).
+    pub fn hard_pause_admin(env: Env, caller: Address) -> Result<(), RevoraError> {
+        caller.require_auth();
+        let admin: Address =
+            env.storage().persistent().get(&DataKey::Admin).ok_or(RevoraError::NotInitialized)?;
+        if caller != admin {
+            return Err(RevoraError::NotAuthorized);
+        }
+        env.storage().persistent().set(&DataKey::Paused, &PauseState::HardPaused);
+        env.events().publish((EVENT_PAUSED, caller.clone()), ());
+        env.events().publish((EVENT_PAUSED2, caller.clone()), (PauseState::HardPaused,));
+        Ok(())
+    }
+
+    /// Soft-pause the contract (Safety role only).
+    ///
+    /// `SoftPaused` blocks reports and deposits but **allows** `claim`, so
+    /// holders can still withdraw their funds during incident response.
+    /// The safety role cannot escalate to `HardPaused`; only the admin can.
     /// This operation is idempotent.
     ///
     /// ### Parameters
@@ -1959,8 +2105,9 @@ impl RevoraRevenueShare {
         if caller != safety {
             return Err(RevoraError::NotAuthorized);
         }
-        env.storage().persistent().set(&DataKey::Paused, &true);
+        env.storage().persistent().set(&DataKey::Paused, &PauseState::SoftPaused);
         env.events().publish((EVENT_PAUSED, caller.clone()), ());
+        env.events().publish((EVENT_PAUSED2, caller.clone()), (PauseState::SoftPaused,));
         Ok(())
     }
 
@@ -1978,19 +2125,62 @@ impl RevoraRevenueShare {
         if caller != safety {
             return Err(RevoraError::NotAuthorized);
         }
-        env.storage().persistent().set(&DataKey::Paused, &false);
+        env.storage().persistent().set(&DataKey::Paused, &PauseState::NotPaused);
         env.events().publish((EVENT_UNPAUSED, caller.clone()), ());
+        env.events().publish((EVENT_PAUSED2, caller.clone()), (PauseState::NotPaused,));
         Ok(())
     }
 
     /// Query the paused state of the contract.
+    ///
+    /// Returns `true` when the contract is in either `SoftPaused` or `HardPaused` state,
+    /// preserving backward compatibility with callers that only need a binary signal.
+    /// Use `get_pause_state` to distinguish between the two tiers.
     pub fn is_paused(env: Env) -> bool {
-        env.storage().persistent().get::<DataKey, bool>(&DataKey::Paused).unwrap_or(false)
+        matches!(
+            env.storage()
+                .persistent()
+                .get::<DataKey, PauseState>(&DataKey::Paused)
+                .unwrap_or(PauseState::NotPaused),
+            PauseState::SoftPaused | PauseState::HardPaused
+        )
     }
 
-    /// Helper: return error if contract is paused. Used by state-mutating entrypoints.
+    /// Return the current `PauseState` tier.
+    ///
+    /// - `NotPaused`  – all operations open.
+    /// - `SoftPaused` – reports/deposits blocked; `claim` allowed.
+    /// - `HardPaused` – all state-mutating operations blocked including `claim`.
+    pub fn get_pause_state(env: Env) -> PauseState {
+        env.storage()
+            .persistent()
+            .get::<DataKey, PauseState>(&DataKey::Paused)
+            .unwrap_or(PauseState::NotPaused)
+    }
+
+    /// Helper: block if the contract is in SoftPaused or HardPaused state.
+    /// Used by reports, deposits, and all non-claim state-mutating entrypoints.
     fn require_not_paused(env: &Env) -> Result<(), RevoraError> {
-        if env.storage().persistent().get::<DataKey, bool>(&DataKey::Paused).unwrap_or(false) {
+        let state = env
+            .storage()
+            .persistent()
+            .get::<DataKey, PauseState>(&DataKey::Paused)
+            .unwrap_or(PauseState::NotPaused);
+        if matches!(state, PauseState::SoftPaused | PauseState::HardPaused) {
+            return Err(RevoraError::ContractPaused);
+        }
+        Ok(())
+    }
+
+    /// Helper: block only if the contract is in HardPaused state.
+    /// Used exclusively by `claim` so holders can still withdraw during a SoftPause.
+    fn require_not_hard_paused(env: &Env) -> Result<(), RevoraError> {
+        let state = env
+            .storage()
+            .persistent()
+            .get::<DataKey, PauseState>(&DataKey::Paused)
+            .unwrap_or(PauseState::NotPaused);
+        if matches!(state, PauseState::HardPaused) {
             return Err(RevoraError::ContractPaused);
         }
         Ok(())
@@ -3671,9 +3861,7 @@ impl RevoraRevenueShare {
         enforce: bool,
     ) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
-        if env.storage().persistent().get::<DataKey, bool>(&DataKey::Paused).unwrap_or(false) {
-            return Err(RevoraError::ContractPaused);
-        }
+        Self::require_not_paused(&env)?;
 
         // Auth-first: authenticate before any state reads or side effects.
         // This prevents unauthenticated callers from probing offering existence
@@ -3738,9 +3926,7 @@ impl RevoraRevenueShare {
         concentration_bps: u32,
     ) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
-        if env.storage().persistent().get::<DataKey, bool>(&DataKey::Paused).unwrap_or(false) {
-            return Err(RevoraError::ContractPaused);
-        }
+        Self::require_not_paused(&env)?;
         issuer.require_auth();
 
         if concentration_bps > 10_000 {
@@ -4548,6 +4734,11 @@ impl RevoraRevenueShare {
         }
 
         let mut added_bps: u32 = 0;
+
+        // Maintain per-offering running total and validate aggregate cap.
+        let total_key = DataKey::HolderShareTotal(offering_id.clone());
+        let mut current_total: u32 = env.storage().persistent().get(&total_key).unwrap_or(0);
+
         for i in 0..batch_len {
             let (holder, share_bps) = holders.get(i).unwrap();
             let slot = start_index.saturating_add(i);
@@ -4558,11 +4749,24 @@ impl RevoraRevenueShare {
                 &(holder.clone(), share_bps),
             );
 
+            // Compute delta against previously persisted holder share.
+            let old_share: u32 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::HolderShare(offering_id.clone(), holder.clone()))
+                .unwrap_or(0);
+
+            let new_total = current_total.saturating_sub(old_share).saturating_add(share_bps);
+            if new_total > 10_000 {
+                return Err(RevoraError::InvalidShareBps);
+            }
+
             // Update live holder share so claim() works immediately.
             env.storage()
                 .persistent()
-                .set(&DataKey::HolderShare(offering_id.clone(), holder), &share_bps);
+                .set(&DataKey::HolderShare(offering_id.clone(), holder.clone()), &share_bps);
 
+            current_total = new_total;
             added_bps = added_bps.saturating_add(share_bps);
         }
 
@@ -4572,6 +4776,11 @@ impl RevoraRevenueShare {
         entry.holder_count = new_holder_count;
         entry.total_bps = new_total_bps;
         env.storage().persistent().set(&entry_key, &entry);
+
+        // Persist updated per-offering running total.
+        env.storage()
+            .persistent()
+            .set(&DataKey::HolderShareTotal(offering_id.clone()), &current_total);
 
         env.events().publish(
             (EVENT_SNAP_SHARES_APPLIED, issuer, namespace, token),
@@ -4628,10 +4837,11 @@ impl RevoraRevenueShare {
         Self::require_not_frozen(&env)?;
         Self::require_not_paused(&env)?;
         issuer.require_auth();
-        if share_bps > 10_000 {
-            return Err(RevoraError::InvalidShareBps);
-        }
-        let offering_id = OfferingId { issuer: issuer.clone(), namespace, token };
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
         Self::get_current_issuer(
             &env,
             issuer.clone(),
@@ -4639,8 +4849,10 @@ impl RevoraRevenueShare {
             offering_id.token.clone(),
         )
         .ok_or(RevoraError::OfferingNotFound)?;
-        env.storage().persistent().set(&DataKey::HolderShare(offering_id, holder), &share_bps);
-        Ok(())
+
+        // Delegate to internal writer which maintains the aggregate running total
+        // and enforces the per-offering sum invariant (≤ 10_000 bps).
+        Self::set_holder_share_internal(&env, issuer, namespace, token, holder, share_bps)
     }
 
     /// Get a holder's revenue share in basis points for an offering.
@@ -4785,6 +4997,9 @@ impl RevoraRevenueShare {
         token: Address,
         max_periods: u32,
     ) -> Result<i128, RevoraError> {
+        // HardPaused blocks claim; SoftPaused allows it so holders can withdraw during incidents.
+        Self::require_not_hard_paused(&env)?;
+
         holder.require_auth();
 
         let offering_id = OfferingId { issuer, namespace, token };
@@ -5055,7 +5270,7 @@ impl RevoraRevenueShare {
 }
 
 // â”€â”€ Holder shares, claims, admin, governance, and utility methods â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-// Plain impl block â€” excluded from the ABI spec to keep spec XDR within limit.
+#[contractimpl]
 impl RevoraRevenueShare {
     ///
     /// The share determines the percentage of a period's revenue the holder can claim.
